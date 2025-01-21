@@ -6,6 +6,7 @@ import json
 
 import torch
 import torch.nn.functional as F
+import torch.profiler
 
 from einops import rearrange
 
@@ -79,14 +80,29 @@ else:
         top_p=args.topp,
         repetition_penalty=args.repetition_penalty,
     )
+
+# with torch.profiler.profile(
+#     activities=[
+#         # torch.profiler.ProfilerActivity.CPU,
+#         torch.profiler.ProfilerActivity.CUDA  # GPU if available
+#     ],
+#     record_shapes=True,  # Records input shapes
+#     profile_memory=True,  # Tracks memory usage
+#     with_stack=True  # Captures stack traces
+# ) as profiler:
+#     out = fn()
+
+# with open("profiler.txt", "w") as f:
+#     f.write(profiler.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+
 out = fn()
 if args.prompt is not None:
     print(tokenizer.batch_decode(out.sequences.tolist()))
 
-torch.cuda.synchronize()
-start = time.time()
-for _ in range(repeats):
-    fn()
-torch.cuda.synchronize()
-print(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
-print(f"{args.model_name} prompt processing + decoding time: {(time.time() - start) / repeats * 1000:.0f}ms")
+# torch.cuda.synchronize()
+# start = time.time()
+# for _ in range(repeats):
+#     fn()
+# torch.cuda.synchronize()
+# print(f"Prompt length: {len(input_ids[0])}, generation length: {len(out.sequences[0]) - len(input_ids[0])}")
+# print(f"{args.model_name} prompt processing + decoding time: {(time.time() - start) / repeats * 1000:.0f}ms")

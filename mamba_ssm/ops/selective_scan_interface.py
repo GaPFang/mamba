@@ -6,15 +6,14 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 from einops import rearrange, repeat
 
-try:
-    from causal_conv1d import causal_conv1d_fn
-    import causal_conv1d_cuda
-except ImportError:
-    causal_conv1d_fn = None
-    causal_conv1d_cuda = None
+from causal_conv1d import causal_conv1d_fn
+import causal_conv1d_cuda
 
 import selective_scan_cuda
 
+from mamba_ssm.utils.plot import plot_matrix, plot_array, plot_hist
+
+torch.set_printoptions(threshold=float('inf'), edgeitems=None, linewidth=1000, precision=3)
 
 class SelectiveScanFn(torch.autograd.Function):
 
@@ -79,16 +78,16 @@ class SelectiveScanFn(torch.autograd.Function):
                 None)
 
 
-def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+def selective_scan_fn(u, delta, A, B, C, layer_idx, D=None, z=None, delta_bias=None, delta_softplus=False,
                      return_last_state=False):
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
-    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    return selective_scan_ref(u, delta, A, B, C, layer_idx, D, z, delta_bias, delta_softplus, return_last_state)
 
 
-def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+def selective_scan_ref(u, delta, A, B, C, layer_idx, D=None, z=None, delta_bias=None, delta_softplus=False,
                       return_last_state=False):
     """
     u: r(B D L)
@@ -122,7 +121,6 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
         B = B.float()
         C = C.float()
     x = A.new_zeros((batch, dim, dstate))
-    ys = []
     deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
     if not is_variable_B:
         deltaB_u = torch.einsum('bdl,dn,bdl->bdln', delta, B, u)
@@ -135,8 +133,18 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     if is_variable_C and C.dim() == 4:
         C = repeat(C, "B G N L -> B (G H) N L", H=dim // C.shape[1])
     last_state = None
+    # print("delta:", delta, file=open("mamba_simple.txt", "a"))
+    # print("u:", u, file=open("mamba_simple.txt", "a"))
+    # print("A:", A.shape)
+    # print("B:", B.shape)
+    # print("C:", C.shape)
+    # print("deltaA:", deltaA[:, 0], file=open("deltaA_0.txt", "a"))
+    # print("deltaB_u:", deltaB_u.shape)
+    xs = torch.zeros((u.shape[2], x.shape[0], x.shape[1], x.shape[2]), dtype=dtype_in, device=u.device)
+    ys = []
     for i in range(u.shape[2]):
         x = deltaA[:, :, i] * x + deltaB_u[:, :, i]
+        xs[i] = x
         if not is_variable_C:
             y = torch.einsum('bdn,dn->bd', x, C)
         else:
@@ -150,6 +158,81 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
             y = y.real * 2
         ys.append(y)
     y = torch.stack(ys, dim=2) # (batch dim L)
+    log_A = -torch.log(-A)
+    # # x
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "x", "array", "N_D"], f"layer_{layer_idx}", -1, 1, "N", "D"
+    # plot_array(x[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # xs (N_t)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "xs", "array", "N_t"], f"layer_{layer_idx}", -1, 1, "N", "t"
+    # plot_array(xs[:, 0, 0, :].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # xs (D_t)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "xs", "array", "D_t"], f"layer_{layer_idx}", -1, 1, "D", "t"
+    # plot_array(xs[:, 0, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # u
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "u", "array", "L_D"], f"layer_{layer_idx}", -1, 5, "L", "D"
+    # plot_array(u[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # delta
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "delta", "array", "L_D"], f"layer_{layer_idx}", 0, 10, "L", "D"
+    # plot_array(delta[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaA (N_L)
+    plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaA", "array", "N_L"], f"layer_{layer_idx}", 0, 1, "N", "L"
+    plot_array(deltaA[0, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaA (L_D)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaA", "array", "L_D"], f"layer_{layer_idx}", 0, 1, "L", "D"
+    # plot_array(deltaA[0, :, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaA (N_D)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaA", "array", "N_D"], f"layer_{layer_idx}", -10, 10, "N", "D"
+    # plot_array(deltaA[0, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    ## deltaB_u (L_D)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaB_u", "array", "L_D"], f"layer_{layer_idx}", -1, 1, "L", "D"
+    # plot_array(deltaB_u[0, :, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # A
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "A", "array", "N_D"], f"layer_{layer_idx}", -10, 10, "N", "D"
+    # plot_array(A.cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel, log=True)
+    # # y
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "y", "array", "L_D"], f"layer_{layer_idx}", -10, 10, "L", "D"
+    # plot_array(y[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+
+    # # x
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "x", "matrix", "N_D"], f"layer_{layer_idx}", -1, 1, "N", "D"
+    # plot_matrix(x[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # xs (N_t)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "xs", "matrix", "N_t"], f"layer_{layer_idx}", -1, 1, "N", "t"
+    # plot_matrix(xs[:, 0, 0, :].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # xs (D_t)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "xs", "matrix", "D_t"], f"layer_{layer_idx}", -1, 1, "D", "t"
+    # plot_matrix(xs[:, 0, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # u
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "u", "matrix", "L_D"], f"layer_{layer_idx}", -1, 5, "L", "D"
+    # plot_matrix(u[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # delta
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "delta", "matrix", "L_D"], f"layer_{layer_idx}", 0, 10, "L", "D"
+    # plot_matrix(delta[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaA (N_L)
+    plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaA", "matrix", "N_L"], f"layer_{layer_idx}", 0, 1, "N", "L"
+    plot_matrix(deltaA[0, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaA (L_D)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaA", "matrix", "L_D"], f"layer_{layer_idx}", 0, 1, "L", "D"
+    # plot_matrix(deltaA[0, :, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaA (N_D)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaA", "matrix", "N_D"], f"layer_{layer_idx}", -10, 10, "N", "D"
+    # plot_matrix(deltaA[0, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # deltaB_u (L_D)
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "deltaB_u", "matrix", "L_D"], f"layer_{layer_idx}", -1, 1, "L", "D"
+    # plot_matrix(deltaB_u[0, :, :, 0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+    # # A
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "A", "matrix", "N_D"], f"layer_{layer_idx}", -10, 10, "N", "D"
+    # plot_matrix(A.cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel, log=True)
+    # # y
+    # plot_dir, plot_name, vmin, vmax, xlabel, ylabel = ["plots", "y", "matrix", "L_D"], f"layer_{layer_idx}", -10, 10, "L", "D"
+    # plot_matrix(y[0].cpu().numpy(), plot_dir, plot_name, vmin, vmax, xlabel, ylabel)
+
+    # # deltaA
+    # plot_dir, plot_name= ["plots", "deltaA", "hist"], f"layer_{layer_idx}"
+    # plot_hist(deltaA.cpu().numpy(), plot_dir, plot_name)
+    # # log_A
+    # plot_dir, plot_name= ["plots", "log_A", "hist"], f"layer_{layer_idx}"
+    # plot_hist(log_A.cpu().numpy(), plot_dir, plot_name)
     out = y if D is None else y + u * rearrange(D, "d -> d 1")
     if z is not None:
         out = out * F.silu(z)
@@ -314,7 +397,7 @@ def mamba_inner_fn(
     A, B=None, C=None, D=None, delta_bias=None, B_proj_bias=None,
     C_proj_bias=None, delta_softplus=True
 ):
-    return MambaInnerFn.apply(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
+    return mamba_inner_ref(xz, conv1d_weight, conv1d_bias, x_proj_weight, delta_proj_weight,
                               out_proj_weight, out_proj_bias,
                               A, B, C, D, delta_bias, B_proj_bias, C_proj_bias, delta_softplus)
 
